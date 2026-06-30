@@ -55,14 +55,17 @@ def load_config():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-def load_processed():
+def load_processed() -> dict:
+    """Map of groupUrl -> list of already-handled post ids, one entry per
+    configured pair so multiple group/channel pairs don't collide."""
     if PROCESSED_PATH.exists():
-        return set(json.loads(PROCESSED_PATH.read_text(encoding="utf-8")))
-    return set()
+        return json.loads(PROCESSED_PATH.read_text(encoding="utf-8"))
+    return {}
 
 
-def save_processed(processed):
-    PROCESSED_PATH.write_text(json.dumps(sorted(processed), indent=2), encoding="utf-8")
+def save_processed(processed: dict):
+    serializable = {url: sorted(ids) for url, ids in processed.items()}
+    PROCESSED_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
 
 
 def has_stored_session():
@@ -77,11 +80,38 @@ def is_logged_in(page) -> bool:
         return False
 
 
+# Going straight to id.vk.com/auth (VK's separate SSO domain) tends to trip
+# its antibot check for automated browsers. Landing on the main vk.com/vk.ru
+# page and logging in from the form embedded there avoids that redirect.
+LOGIN_DOMAINS = ["https://vk.com/", "https://vk.ru/"]
+
+
+def open_login_page(page):
+    for url in LOGIN_DOMAINS:
+        page.goto(url, wait_until="domcontentloaded")
+        time.sleep(1.5)
+        if "id.vk.com" not in page.url:
+            return url
+        logger.warning(f"{url} redirected to {page.url} (antibot SSO redirect), trying next domain...")
+    # All candidates redirected to id.vk.com; fall back to the last one tried
+    # rather than failing outright -- the user can still complete login there.
+    logger.warning("Could not avoid id.vk.com/auth redirect; proceeding anyway.")
+    return page.url
+
+
 def perform_manual_login(browser):
     logger.info("No saved session found. Opening a visible browser for manual login...")
-    context = browser.new_context()
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1366, "height": 850},
+        locale="ru-RU",
+        timezone_id="Europe/Moscow",
+    )
     page = context.new_page()
-    page.goto("https://vk.com/")
+    open_login_page(page)
 
     logger.info("Log in to VK in the opened browser window. Waiting up to 5 minutes...")
     deadline = time.time() + 5 * 60
@@ -115,7 +145,12 @@ def extract_paragraphs(card, text_selector: str) -> list[str]:
     return lines
 
 
-def scan_group_posts(page, group_url: str, max_posts: int, processed: set):
+def scan_group_posts(page, group_url: str, max_posts: int, processed_ids: set, baseline: bool = False):
+    """Collect recent posts from a group wall.
+
+    When baseline=True, every post found is returned regardless of
+    processed_ids (used once per group, right after startup, to record
+    what already existed without reposting it)."""
     page.goto(group_url, wait_until="domcontentloaded")
     time.sleep(random.uniform(0.8, 1.4))
 
@@ -127,7 +162,9 @@ def scan_group_posts(page, group_url: str, max_posts: int, processed: set):
 
         for card in cards:
             post_id = card.get_attribute("data-post-id")
-            if not post_id or post_id in processed:
+            if not post_id:
+                continue
+            if not baseline and post_id in processed_ids:
                 continue
             if any(p["id"] == post_id for p in found):
                 continue
@@ -149,8 +186,11 @@ def scan_group_posts(page, group_url: str, max_posts: int, processed: set):
         time.sleep(random.uniform(0.6, 1.1))
         attempts += 1
 
+    found = found[:max_posts]
+    if baseline:
+        return found
     # Oldest-first so the channel ends up in the same chronological order.
-    return list(reversed(found[:max_posts]))
+    return list(reversed(found))
 
 
 def download_image(page, url: str, index: int) -> Path:
@@ -214,8 +254,52 @@ def repost_to_channel(page, channel_url: str, post: dict):
         pass
 
 
+def get_pairs(config) -> list[dict]:
+    if "pairs" in config:
+        return config["pairs"]
+    # Back-compat with the older single-pair config shape.
+    return [{"groupUrl": config["groupUrl"], "channelUrl": config["channelUrl"]}]
+
+
+def process_pair(page, pair: dict, max_posts: int, processed: dict):
+    group_url = pair["groupUrl"]
+    channel_url = pair["channelUrl"]
+    processed_ids = set(processed.get(group_url, []))
+    first_run_for_pair = group_url not in processed
+
+    if first_run_for_pair:
+        # Snapshot whatever already exists right now and mark it as seen,
+        # without reposting, so only posts published *after* this startup
+        # get mirrored.
+        existing = scan_group_posts(page, group_url, max_posts, processed_ids, baseline=True)
+        processed[group_url] = [p["id"] for p in existing]
+        save_processed(processed)
+        logger.info(
+            f"[{group_url}] First run: marked {len(existing)} existing post(s) as "
+            f"already seen (not reposted)."
+        )
+        return
+
+    posts = scan_group_posts(page, group_url, max_posts, processed_ids)
+    logger.info(f"[{group_url}] Found {len(posts)} new post(s) to mirror -> {channel_url}")
+
+    for post in posts:
+        logger.info(f"[{group_url}] Mirroring post {post['id']}...")
+        try:
+            repost_to_channel(page, channel_url, post)
+            processed.setdefault(group_url, []).append(post["id"])
+            save_processed(processed)
+            logger.info(f"  -> done ({post['id']})")
+        except Exception:
+            logger.error(f"  -> failed ({post['id']}): {traceback.format_exc()}")
+        time.sleep(random.uniform(2.0, 5.0))  # space out posts
+
+
 def run_once(browser, config):
     processed = load_processed()
+    pairs = get_pairs(config)
+    max_posts = config.get("maxPostsPerScan", 10)
+
     context = browser.new_context(storage_state=str(STATE_PATH))
     context.grant_permissions(["clipboard-read", "clipboard-write"])
     page = context.new_page()
@@ -226,21 +310,13 @@ def run_once(browser, config):
                 "Saved session is no longer valid. Run with --login-only to re-authenticate."
             )
 
-        posts = scan_group_posts(
-            page, config["groupUrl"], config.get("maxPostsPerScan", 10), processed
-        )
-        logger.info(f"Found {len(posts)} new group post(s) to mirror.")
-
-        for post in posts:
-            logger.info(f"Mirroring post {post['id']}...")
+        for pair in pairs:
             try:
-                repost_to_channel(page, config["channelUrl"], post)
-                processed.add(post["id"])
-                save_processed(processed)
-                logger.info(f"  -> done ({post['id']})")
+                process_pair(page, pair, max_posts, processed)
             except Exception:
-                logger.error(f"  -> failed ({post['id']}): {traceback.format_exc()}")
-            time.sleep(random.uniform(2.0, 5.0))  # space out posts
+                logger.error(
+                    f"[{pair.get('groupUrl')}] Pair failed: {traceback.format_exc()}"
+                )
     finally:
         context.close()
 

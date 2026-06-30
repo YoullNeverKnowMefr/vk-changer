@@ -1,6 +1,14 @@
 {
-  "groupUrl": "https://vk.com/yourgroup",
-  "channelUrl": "https://vk.com/channel/123456789",
+  "pairs": [
+    {
+      "groupUrl": "https://vk.com/yourgroup1",
+      "channelUrl": "https://vk.com/channel/111111111"
+    },
+    {
+      "groupUrl": "https://vk.com/yourgroup2",
+      "channelUrl": "https://vk.com/channel/222222222"
+    }
+  ],
   "pollIntervalSeconds": 300,
   "maxPostsPerScan": 10
 }
