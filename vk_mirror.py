@@ -24,7 +24,7 @@ AUTH_DIR = BASE_DIR / "auth"
 DATA_DIR = BASE_DIR / "data"
 TMP_DIR = BASE_DIR / "tmp"
 LOG_DIR = BASE_DIR / "logs"
-STATE_PATH = AUTH_DIR / "state.json"
+STATE_PATH = BASE_DIR / "session.vk"
 PROCESSED_PATH = DATA_DIR / "processed.json"
 CONFIG_PATH = BASE_DIR / "config.json"
 
@@ -323,7 +323,28 @@ def process_pair(page, pair: dict, max_posts: int, processed: dict):
         time.sleep(random.uniform(2.0, 5.0))  # space out posts
 
 
+def ensure_session(browser):
+    """Check that the saved session is still valid. If VK has logged us out,
+    open the login page in the same visible browser and wait for the user
+    to sign in again, then save the refreshed session to disk."""
+    storage_kwargs = {"storage_state": str(STATE_PATH)} if STATE_PATH.exists() else {}
+    ctx = browser.new_context(**storage_kwargs)
+    ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+    page = ctx.new_page()
+    open_login_page(page)
+    if is_logged_in(page):
+        ctx.close()
+        return
+    ctx.close()
+
+    logger.warning("Session expired — waiting for manual re-login in the browser window...")
+    perform_manual_login(browser)
+    logger.info("Re-login successful, continuing.")
+
+
 def run_once(browser, config):
+    ensure_session(browser)
+
     processed = load_processed()
     pairs = get_pairs(config)
     max_posts = config.get("maxPostsPerScan", 10)
@@ -333,11 +354,6 @@ def run_once(browser, config):
     page = context.new_page()
 
     try:
-        if not is_logged_in(page):
-            raise RuntimeError(
-                "Saved session is no longer valid. Run with --login-only to re-authenticate."
-            )
-
         for pair in pairs:
             try:
                 process_pair(page, pair, max_posts, processed)
