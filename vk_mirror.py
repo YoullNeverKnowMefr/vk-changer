@@ -68,41 +68,54 @@ def save_processed(processed: dict):
     PROCESSED_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
 
 
-def normalize_session():
-    """Accept a raw VK localStorage token dump as session.vk and convert it
-    to the Playwright storageState format the browser context expects.
+CONTEXT_KWARGS = {
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+    ),
+    "viewport": {"width": 1366, "height": 850},
+    "locale": "ru-RU",
+    "timezone_id": "Europe/Moscow",
+}
 
-    Supported input shape (what VK stores in localStorage):
-        { "vk_token_user": { "token": { ... } } }
 
-    The file is overwritten in-place with the converted format so subsequent
-    runs load it without any extra work."""
+def load_vk_token() -> dict | None:
+    """Read session.vk and return the value of the vk_token_user key."""
     if not STATE_PATH.exists():
-        return
-    raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    if "vk_token_user" not in raw:
-        return  # already in Playwright format or unknown — leave as-is
+        return None
+    data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    return data.get("vk_token_user")
 
-    logger.info("session.vk is in VK token format — converting to Playwright storageState...")
-    playwright_state = {
-        "cookies": [],
-        "origins": [
-            {
-                "origin": "https://vk.com",
-                "localStorage": [
-                    {"name": "vk_token_user", "value": json.dumps(raw["vk_token_user"])},
-                ],
-            },
-            {
-                "origin": "https://vk.ru",
-                "localStorage": [
-                    {"name": "vk_token_user", "value": json.dumps(raw["vk_token_user"])},
-                ],
-            },
-        ],
-    }
-    STATE_PATH.write_text(json.dumps(playwright_state, indent=2), encoding="utf-8")
-    logger.info("Conversion done — session.vk updated.")
+
+def save_vk_token(token_value: dict):
+    """Write session.vk in native VK localStorage format."""
+    STATE_PATH.write_text(
+        json.dumps({"vk_token_user": token_value}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info(f"Session saved to {STATE_PATH}")
+
+
+def extract_vk_token(page) -> dict | None:
+    """Pull vk_token_user out of the page's localStorage after login."""
+    raw = page.evaluate("() => localStorage.getItem('vk_token_user')")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    return None
+
+
+def make_context(browser, token: dict | None = None):
+    """Create a browser context and, if a token is available, inject it into
+    localStorage before the first page load so VK picks it up automatically."""
+    ctx = browser.new_context(**CONTEXT_KWARGS)
+    ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+    if token is not None:
+        token_str = json.dumps(json.dumps(token, ensure_ascii=False))
+        ctx.add_init_script(f"localStorage.setItem('vk_token_user', {token_str});")
+    return ctx
 
 
 def has_stored_session():
@@ -138,15 +151,7 @@ def open_login_page(page):
 
 def perform_manual_login(browser):
     logger.info("No saved session found. Opening a visible browser for manual login...")
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1366, "height": 850},
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-    )
+    context = make_context(browser)
     page = context.new_page()
     open_login_page(page)
 
@@ -163,8 +168,17 @@ def perform_manual_login(browser):
         context.close()
         raise RuntimeError("Timed out waiting for manual login.")
 
-    context.storage_state(path=str(STATE_PATH))
-    logger.info(f"Session saved to {STATE_PATH}")
+    # Navigate to feed to ensure localStorage is fully populated before reading.
+    if "vk.com/feed" not in page.url and "vk.ru/feed" not in page.url:
+        page.goto("https://vk.com/feed", wait_until="domcontentloaded")
+        time.sleep(1.5)
+
+    token = extract_vk_token(page)
+    if token:
+        save_vk_token(token)
+    else:
+        logger.warning("Could not extract vk_token_user from localStorage. Session may not persist.")
+
     context.close()
 
 
@@ -363,13 +377,15 @@ def process_pair(page, pair: dict, max_posts: int, processed: dict):
 def ensure_session(browser):
     """Check that the saved session is still valid. If VK has logged us out,
     open the login page in the same visible browser and wait for the user
-    to sign in again, then save the refreshed session to disk."""
-    storage_kwargs = {"storage_state": str(STATE_PATH)} if STATE_PATH.exists() else {}
-    ctx = browser.new_context(**storage_kwargs)
-    ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+    to sign in again, then save the refreshed token to session.vk."""
+    ctx = make_context(browser, load_vk_token())
     page = ctx.new_page()
     open_login_page(page)
     if is_logged_in(page):
+        # Refresh token in case VK rotated it during this session.
+        fresh = extract_vk_token(page)
+        if fresh:
+            save_vk_token(fresh)
         ctx.close()
         return
     ctx.close()
@@ -386,8 +402,7 @@ def run_once(browser, config):
     pairs = get_pairs(config)
     max_posts = config.get("maxPostsPerScan", 10)
 
-    context = browser.new_context(storage_state=str(STATE_PATH))
-    context.grant_permissions(["clipboard-read", "clipboard-write"])
+    context = make_context(browser, load_vk_token())
     page = context.new_page()
 
     try:
@@ -408,7 +423,6 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run a single scan/repost pass and exit instead of looping forever.")
     args = parser.parse_args()
 
-    normalize_session()
     needs_login = args.login_only or not has_stored_session()
 
     with sync_playwright() as p:
