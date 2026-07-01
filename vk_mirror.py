@@ -95,43 +95,87 @@ def save_processed(processed: dict[str, list[str]]) -> None:
     )
 
 
-def remove_signature(text: str, signature: str) -> str:
-    """Удаляет подпись — ВСЕГДА последнюю непустую строку поста (в ней же
-    ссылка на мессенджер). Оригинальное форматирование остального текста
-    сохраняется точь-в-точь: переносы строк, пустые строки, отступы не
-    меняются — удаляется только строка подписи и «висящие» пустые строки
-    после неё.
+def _norm_for_match(s: str) -> str:
+    """Нормализация для сравнения подписи: нижний регистр, выкидываем пробелы,
+    эмодзи и прочие символы, оставляя буквы/цифры (любой язык) и символы URL.
+    Так «Мы теперь и в Мах 🚀 https://max.ru/x» и «мы теперь и в мах🚀https://max.ru/x»
+    сравниваются одинаково."""
+    keep_url = set(":/._-?&=%#@~+")
+    return "".join(ch for ch in s.lower() if ch.isalnum() or ch in keep_url)
 
-    Если signature задан в конфиге — подпись удаляется только если последняя
-    строка действительно содержит эту фразу (страховка от случайного удаления
-    обычного текста). Если signature пустой — удаляется последняя непустая
-    строка как есть."""
-    # Нормализуем только тип перевода строки, ничего не обрезаем.
+
+def _is_link_line(line: str) -> bool:
+    """Похожа ли строка на отдельную строку-ссылку (её надо удалить вместе с
+    подписью, даже если в конфиге указан только текст без ссылки)."""
+    t = line.strip()
+    if not t:
+        return False
+    if t.lower().startswith(("http://", "https://")):
+        return True
+    # одиночный токен вида domain.tld/path
+    return " " not in t and "." in t and "/" in t
+
+
+def remove_signature(text: str, signature: str) -> str:
+    """Удаляет подпись — она ВСЕГДА в конце поста (в ней текст + ссылка на
+    мессенджер, иногда разбита на две строки). Оригинальное форматирование
+    остального текста сохраняется точь-в-точь: одиночные/двойные переносы,
+    пустые строки и отступы не меняются.
+
+    Сравнение устойчиво к пробелам и эмодзи (см. _norm_for_match). Если
+    signature пустой — просто удаляется последняя непустая строка."""
     lines = text.replace("\r\n", "\n").split("\n")
 
-    # Индекс последней непустой строки — это и есть подпись.
-    last_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].strip():
-            last_idx = i
+    # Обрежем висящие пустые строки в конце (они не часть текста).
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return text
+
+    sig_norm = _norm_for_match(signature or "")
+
+    if not sig_norm:
+        # Подпись в конфиге не задана — убираем последнюю непустую строку.
+        removed = lines.pop()
+        logging.info("Удалена подпись (последняя строка): %s", removed.strip()[:150])
+    else:
+        removed_lines: list[str] = []
+        # Удаляем с конца строки, каждая из которых — часть подписи. Это
+        # покрывает варианты: подпись в 1 строку, подпись в 2 строки, а также
+        # когда в конфиге указан только общий текст, а ссылка у каждой группы
+        # своя (тогда строку-ссылку снимаем, если строка над ней — подпись).
+        while lines and len(removed_lines) < 3:
+            candidate = lines[-1]
+            if not candidate.strip():
+                lines.pop()  # пустая строка внутри/перед подписью
+                continue
+            cand_norm = _norm_for_match(candidate)
+            if cand_norm and (cand_norm in sig_norm or sig_norm in cand_norm):
+                removed_lines.append(lines.pop())
+                continue
+            # Строка-ссылка (напр. другая ссылка без эмодзи) — удаляем её,
+            # только если строка над ней совпадает с подписью из конфига.
+            if _is_link_line(candidate):
+                prev = None
+                for j in range(len(lines) - 2, -1, -1):
+                    if lines[j].strip():
+                        prev = _norm_for_match(lines[j])
+                        break
+                if prev and (prev in sig_norm or sig_norm in prev):
+                    removed_lines.append(lines.pop())
+                    continue
             break
-    if last_idx is None:
-        return text  # пусто — возвращаем как есть
+        if removed_lines:
+            joined = " | ".join(r.strip() for r in reversed(removed_lines))
+            logging.info("Удалена подпись (%d стр.): %s", len(removed_lines), joined[:200])
+        else:
+            logging.info(
+                "Подпись «%s» не найдена в конце поста — текст оставлен без изменений.",
+                signature,
+            )
 
-    needle = (signature or "").strip().lower()
-    if needle and needle not in lines[last_idx].lower():
-        # Последняя строка не похожа на подпись — на всякий случай не трогаем.
-        logging.info(
-            "Подпись «%s» не найдена в последней строке — текст оставлен без изменений.",
-            signature,
-        )
-        return text.rstrip("\n")
-
-    logging.info("Удалена подпись: %s", lines[last_idx].strip()[:150])
-    del lines[last_idx]
-
-    # Убираем ставшие лишними пустые строки в самом конце, но НЕ трогаем
-    # форматирование выше подписи.
+    # Снова убираем ставшие лишними пустые строки в конце, форматирование
+    # выше подписи не трогаем.
     while lines and not lines[-1].strip():
         lines.pop()
 
