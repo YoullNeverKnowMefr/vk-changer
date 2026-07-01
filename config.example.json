@@ -2,13 +2,16 @@
   "pairs": [
     {
       "groupUrl": "https://vk.com/yourgroup1",
-      "channelUrl": "https://vk.com/channel/111111111"
+      "channelUrl": "https://vk.com/im/channels/-230930322",
+      "signature": "Мы теперь и в Max"
     },
     {
       "groupUrl": "https://vk.com/yourgroup2",
-      "channelUrl": "https://vk.com/channel/222222222"
+      "channelUrl": "https://vk.com/im/channels/-111111111",
+      "signature": ""
     }
   ],
   "pollIntervalSeconds": 300,
-  "maxPostsPerScan": 10
+  "maxPostsPerScan": 20,
+  "headless": false
 }
