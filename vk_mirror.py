@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import signal
 import sys
 import time
@@ -96,32 +95,47 @@ def save_processed(processed: dict[str, list[str]]) -> None:
     )
 
 
-def split_paragraphs(text: str) -> list[str]:
-    normalized = text.replace("\r\n", "\n").strip()
-    if not normalized:
-        return []
-    if re.search(r"\n\s*\n", normalized):
-        return [p.strip() for p in re.split(r"\n\s*\n", normalized) if p.strip()]
-    return [line.strip() for line in normalized.split("\n") if line.strip()]
-
-
 def remove_signature(text: str, signature: str) -> str:
-    """Удаляет подпись — последний абзац, содержащий заданную фразу подписи.
-    Сам текст поста при этом не трогается. Если signature пустой — возвращает
-    текст как есть (с сохранением абзацев)."""
-    signature = (signature or "").strip()
-    paragraphs = split_paragraphs(text)
-    if not paragraphs:
-        return text.strip()
-    if signature:
-        needle = signature.lower()
-        for index in range(len(paragraphs) - 1, -1, -1):
-            if needle in paragraphs[index].lower():
-                removed = paragraphs.pop(index)
-                logging.info("Удалена подпись: %s", removed.replace("\n", " ")[:120])
-                break
-    # Восстанавливаем текст с пустой строкой между абзацами (как в оригинале).
-    return "\n\n".join(paragraphs).strip()
+    """Удаляет подпись — ВСЕГДА последнюю непустую строку поста (в ней же
+    ссылка на мессенджер). Оригинальное форматирование остального текста
+    сохраняется точь-в-точь: переносы строк, пустые строки, отступы не
+    меняются — удаляется только строка подписи и «висящие» пустые строки
+    после неё.
+
+    Если signature задан в конфиге — подпись удаляется только если последняя
+    строка действительно содержит эту фразу (страховка от случайного удаления
+    обычного текста). Если signature пустой — удаляется последняя непустая
+    строка как есть."""
+    # Нормализуем только тип перевода строки, ничего не обрезаем.
+    lines = text.replace("\r\n", "\n").split("\n")
+
+    # Индекс последней непустой строки — это и есть подпись.
+    last_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip():
+            last_idx = i
+            break
+    if last_idx is None:
+        return text  # пусто — возвращаем как есть
+
+    needle = (signature or "").strip().lower()
+    if needle and needle not in lines[last_idx].lower():
+        # Последняя строка не похожа на подпись — на всякий случай не трогаем.
+        logging.info(
+            "Подпись «%s» не найдена в последней строке — текст оставлен без изменений.",
+            signature,
+        )
+        return text.rstrip("\n")
+
+    logging.info("Удалена подпись: %s", lines[last_idx].strip()[:150])
+    del lines[last_idx]
+
+    # Убираем ставшие лишними пустые строки в самом конце, но НЕ трогаем
+    # форматирование выше подписи.
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    return "\n".join(lines)
 
 
 def pair_signature(config: dict[str, Any], pair: dict[str, str]) -> str:
