@@ -83,7 +83,7 @@ def is_logged_in(page) -> bool:
 # Going straight to id.vk.com/auth (VK's separate SSO domain) tends to trip
 # its antibot check for automated browsers. Landing on the main vk.com/vk.ru
 # page and logging in from the form embedded there avoids that redirect.
-LOGIN_DOMAINS = ["https://vk.com/", "https://vk.ru/"]
+LOGIN_DOMAINS = ["https://vk.com/feed", "https://vk.ru/feed"]
 
 
 def open_login_page(page):
@@ -131,17 +131,45 @@ def perform_manual_login(browser):
     context.close()
 
 
+def get_signature_lines(card) -> list[str]:
+    """Return the lines that make up the post signature («подпись»), so they
+    can be stripped from the body text before reposting."""
+    sig_el = card.locator(GROUP["post_signature"]).first
+    if sig_el.count() == 0:
+        return []
+    raw = sig_el.evaluate("node => node.innerText")
+    return [l for l in raw.replace("\r\n", "\n").split("\n") if l.strip()]
+
+
 def extract_paragraphs(card, text_selector: str) -> list[str]:
     """Read the rendered text exactly as the browser lays it out, then split
     into paragraphs on the line breaks VK actually rendered, so blank lines
-    and paragraph spacing match the source post."""
+    and paragraph spacing match the source post.
+
+    The post signature («подпись» — a fixed group-level line appended to
+    every post) is detected and removed from the result so it is not copied
+    into the channel."""
     el = card.locator(text_selector).first
     if el.count() == 0:
         return []
     rendered = el.evaluate("node => node.innerText")
-    # innerText reflects real visual line breaks (including blank lines for
-    # <br><br> or stacked <div>s), so a plain split preserves spacing.
     lines = rendered.replace("\r\n", "\n").split("\n")
+
+    sig_lines = get_signature_lines(card)
+    if sig_lines:
+        # VK appends the signature at the tail of the post body.  Strip those
+        # lines from the end (ignoring any trailing blank lines between them).
+        sig_set = set(sig_lines)
+        while lines and lines[-1].strip() in sig_set | {""}:
+            if lines[-1].strip() in sig_set:
+                lines.pop()
+            else:
+                # trailing blank line before signature — remove it too
+                lines.pop()
+        # Remove any blank lines that were padding above the signature
+        while lines and lines[-1].strip() == "":
+            lines.pop()
+
     return lines
 
 
@@ -330,16 +358,13 @@ def main():
     needs_login = args.login_only or not has_stored_session()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not needs_login)
+        browser = p.chromium.launch(headless=False)
 
         try:
             if needs_login:
                 perform_manual_login(browser)
                 if args.login_only:
                     return
-                # Switch to a headless browser for the unattended run that follows.
-                browser.close()
-                browser = p.chromium.launch(headless=True)
 
             config = load_config()
 
