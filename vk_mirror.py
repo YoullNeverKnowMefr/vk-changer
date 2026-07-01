@@ -233,14 +233,20 @@ def scan_group_posts(page, group_url: str, max_posts: int, processed_ids: set, b
     page.goto(group_url, wait_until="domcontentloaded")
     time.sleep(random.uniform(0.8, 1.4))
 
+    logger.info(f"[scan] current page URL after navigation: {page.url}")
+
     found = []
     attempts = 0
 
     while len(found) < max_posts and attempts < 8:
         cards = page.locator(GROUP["post_card"]).all()
+        logger.info(f"[scan] attempt {attempts+1}: found {len(cards)} card(s) on page with selector «{GROUP['post_card']}»")
 
+        ids_on_page = []
         for card in cards:
             post_id = card.get_attribute("data-post-id")
+            if post_id:
+                ids_on_page.append(post_id)
             if not post_id:
                 continue
             if not baseline and post_id in processed_ids:
@@ -257,6 +263,11 @@ def scan_group_posts(page, group_url: str, max_posts: int, processed_ids: set, b
                     images.append(src)
 
             found.append({"id": post_id, "paragraphs": paragraphs, "images": images})
+
+        already = [i for i in ids_on_page if i in processed_ids]
+        logger.info(
+            f"[scan] ids on page: {ids_on_page} | already processed: {already} | new this pass: {len(found)}"
+        )
 
         if len(found) >= max_posts:
             break
@@ -378,12 +389,17 @@ def ensure_session(browser):
     """Check that the saved session is still valid. If VK has logged us out,
     open the login page in the same visible browser and wait for the user
     to sign in again, then save the refreshed token to session.vk."""
-    ctx = make_context(browser, load_vk_token())
+    token = load_vk_token()
+    logger.info(f"[session] session.vk exists: {STATE_PATH.exists()} | vk_token_user loaded: {token is not None}")
+    ctx = make_context(browser, token)
     page = ctx.new_page()
     open_login_page(page)
-    if is_logged_in(page):
-        # Refresh token in case VK rotated it during this session.
+    logger.info(f"[session] page URL after open_login_page: {page.url}")
+    logged = is_logged_in(page)
+    logger.info(f"[session] is_logged_in: {logged}")
+    if logged:
         fresh = extract_vk_token(page)
+        logger.info(f"[session] vk_token_user in localStorage: {fresh is not None}")
         if fresh:
             save_vk_token(fresh)
         ctx.close()
