@@ -68,6 +68,43 @@ def save_processed(processed: dict):
     PROCESSED_PATH.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
 
 
+def normalize_session():
+    """Accept a raw VK localStorage token dump as session.vk and convert it
+    to the Playwright storageState format the browser context expects.
+
+    Supported input shape (what VK stores in localStorage):
+        { "vk_token_user": { "token": { ... } } }
+
+    The file is overwritten in-place with the converted format so subsequent
+    runs load it without any extra work."""
+    if not STATE_PATH.exists():
+        return
+    raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    if "vk_token_user" not in raw:
+        return  # already in Playwright format or unknown — leave as-is
+
+    logger.info("session.vk is in VK token format — converting to Playwright storageState...")
+    playwright_state = {
+        "cookies": [],
+        "origins": [
+            {
+                "origin": "https://vk.com",
+                "localStorage": [
+                    {"name": "vk_token_user", "value": json.dumps(raw["vk_token_user"])},
+                ],
+            },
+            {
+                "origin": "https://vk.ru",
+                "localStorage": [
+                    {"name": "vk_token_user", "value": json.dumps(raw["vk_token_user"])},
+                ],
+            },
+        ],
+    }
+    STATE_PATH.write_text(json.dumps(playwright_state, indent=2), encoding="utf-8")
+    logger.info("Conversion done — session.vk updated.")
+
+
 def has_stored_session():
     return STATE_PATH.exists()
 
@@ -371,6 +408,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run a single scan/repost pass and exit instead of looping forever.")
     args = parser.parse_args()
 
+    normalize_session()
     needs_login = args.login_only or not has_stored_session()
 
     with sync_playwright() as p:
